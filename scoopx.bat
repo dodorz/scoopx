@@ -180,6 +180,79 @@ function Detect-Arch {
     if ([Environment]::Is64BitOperatingSystem) { return '64bit' } else { return '32bit' }
 }
 
+function Get-ManifestBins {
+    # Parse the manifest's bin entries the same way scoop does (scoop's shim_def):
+    # each entry is a path string, or an array of [target, shim_name, args].
+    param($Manifest)
+    $bins = @()
+    if (-not $Manifest -or -not $Manifest.bin) { return $bins }
+    foreach ($b in @($Manifest.bin)) {
+        $target = $null; $shimName = $null; $binArgs = @()
+        if ($b -is [string]) {
+            $target = $b
+        } else {
+            $target = $b[0]
+            if ($b.Length -ge 2 -and $b[1]) { $shimName = $b[1] }
+            if ($b.Length -ge 3 -and $b[2]) { $binArgs = @($b[2]) }
+        }
+        if (-not $target) { continue }
+        $label = if ($shimName) { $shimName } else { [IO.Path]::GetFileNameWithoutExtension($target) }
+        $bins += [PSCustomObject]@{ Exe = $target; Label = $label; Args = $binArgs }
+    }
+    return $bins
+}
+
+function Test-PackageInstalled {
+    # True when the package directory actually contains the app (a current
+    # junction/link or at least one version directory).
+    param([string]$PkgDir)
+    if (-not $PkgDir -or -not (Test-Path $PkgDir)) { return $false }
+    if (Test-Path (Join-Path $PkgDir 'current')) { return $true }
+    $verDir = Get-ChildItem $PkgDir -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'current' } | Select-Object -First 1
+    return [bool]$verDir
+}
+
+function Get-PackageBinaryCandidates {
+    # Paths checked when running a manifest bin/shortcut entry.
+    param(
+        [string]$AppDir,
+        [string]$CacheDir,
+        [string]$ExePath,
+        [string]$Label
+    )
+    $candidates = @()
+    if ($ExePath) { $candidates += Join-Path $AppDir "current\$ExePath" }
+    if ($Label) {
+        foreach ($ext in @('.cmd', '.exe', '.ps1')) { $candidates += Join-Path $CacheDir "shims\$Label$ext" }
+    }
+    return $candidates
+}
+
+function Resolve-PackageBinary {
+    # Resolve an executable the way scoop does: the manifest path under current\,
+    # then scoop's shims (scoop creates .exe/.cmd/.ps1 shims, never just .cmd),
+    # then a search for the file name under current\. Returns the path or $null.
+    param(
+        [string]$AppDir,
+        [string]$CacheDir,
+        [string]$ExePath,
+        [string]$Label
+    )
+    $hit = Get-PackageBinaryCandidates -AppDir $AppDir -CacheDir $CacheDir -ExePath $ExePath -Label $Label |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($hit) { return $hit }
+
+    $leaf = if ($ExePath) { [IO.Path]::GetFileName($ExePath) } else { $Label }
+    $currentDir = Join-Path $AppDir 'current'
+    if ($leaf -and (Test-Path $currentDir)) {
+        $found = Get-ChildItem $currentDir -Recurse -File -Filter $leaf -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+    return $null
+}
+
 function Install-Package {
     param(
         [string]$PkgSpec,
@@ -266,8 +339,14 @@ function Install-Package {
     $hash = $hash.Substring(0, 16)
     $cacheDir = Join-Path $SCOOPX_DATA "cache\$hash"
 
-    # Check cache hit (skip when --isolated to force fresh install)
-    $cacheHit = (-not $ISOLATED) -and (Test-Path $cacheDir) -and (-not $NO_CACHE)
+    # Check cache hit (skip when --isolated to force fresh install).
+    # The cached copy must actually contain the package, otherwise a previous
+    # failed or partial install is retried instead of reused.
+    $cachedPkgDir = Join-Path (Join-Path $cacheDir 'apps') $parsed.Name
+    $cacheHit = (-not $ISOLATED) -and (Test-Path $cacheDir) -and (-not $NO_CACHE) -and (Test-PackageInstalled -PkgDir $cachedPkgDir)
+    if ($VERBOSE -and (Test-Path $cacheDir) -and -not $cacheHit) {
+        Write-Host "[verbose] Cache entry exists but package is missing/incomplete: $cachedPkgDir (reinstalling)" -ForegroundColor Yellow
+    }
 
     # Junction real scoop's apps/persist/cache (unless --isolated)
     $cacheApps = Join-Path $cacheDir 'apps'
@@ -479,6 +558,14 @@ function Install-Package {
             $idx.entries | Add-Member -NotePropertyName $hash -NotePropertyValue $entry -Force
             $idx | ConvertTo-Json -Depth 5 | Set-Content $cacheIdxPath -Encoding UTF8
             if ($VERBOSE) { Write-Host "[verbose] Cached: $hash ($($parsed.Name) $arch)" }
+        } elseif (-not $alreadyInstalled) {
+            # scoop install failed (download timeout, hash mismatch, ...): show
+            # scoop's own error instead of pretending the install succeeded
+            Write-Host ""
+            Write-Host "[scoopx] ERROR: scoop failed to install '$PkgSpec'." -ForegroundColor Red
+            foreach ($line in $scoopOutput) { if ($line) { Write-Host "  $line" } }
+            Write-Host "[scoopx] Nothing was installed. Fix the problem above and run again." -ForegroundColor Red
+            return $null
         }
     }
 
@@ -507,27 +594,39 @@ function Install-Package {
                 if ($verDir -and -not (Test-Path $current)) {
                     New-Item -ItemType Junction -Path $current -Target $verDir.FullName -Force -ErrorAction SilentlyContinue | Out-Null
                 }
-                # Create shims
+                # Create shims from THIS package's manifest (not a random bucket manifest)
                 $finalBuckets = Join-Path $cacheDir 'buckets'
-                $manifest = Get-ChildItem $finalBuckets -Recurse -Filter '*.json' | Select-Object -First 1
+                $manifest = Get-ChildItem $finalBuckets -Recurse -Filter "$($parsed.Name).json" -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($manifest) { $m = Get-Content $manifest.FullName -Raw | ConvertFrom-Json }
+                $shimDir = Join-Path $cacheDir 'shims'
                 if ($m -and $m.bin) {
-                    $raw = @($m.bin)
-                    if ($m.bin -is [string]) { $raw = @($m.bin) }
-                    foreach ($b in $raw) {
-                        $bName = if ($b -is [string]) { $b } else { $b[0] }
-                        $shimName = [IO.Path]::GetFileNameWithoutExtension($bName)
-                        $src = Join-Path $destPkgDir "current\$shimName.exe"
-                        if (-not (Test-Path $src)) { $src = Join-Path $destPkgDir "current\$shimName.cmd" }
+                    foreach ($binDef in (Get-ManifestBins -Manifest $m)) {
+                        $src = Join-Path $destPkgDir "current\$($binDef.Exe)"
+                        if (-not (Test-Path $src)) { $src = Join-Path $destPkgDir "current\$($binDef.Label).exe" }
+                        if (-not (Test-Path $src)) { $src = Join-Path $destPkgDir "current\$($binDef.Label).cmd" }
                         if (Test-Path $src) {
+                            if (-not (Test-Path $shimDir)) { New-Item -ItemType Directory -Path $shimDir -Force -ErrorAction SilentlyContinue | Out-Null }
                             $shimContent = "@echo off", "`"$src`" %*"
-                            Set-Content (Join-Path $cacheDir "shims\$shimName.cmd") $shimContent -Encoding ASCII
+                            Set-Content (Join-Path $shimDir "$($binDef.Label).cmd") $shimContent -Encoding ASCII
                         }
                     }
                 }
                 if ($VERBOSE) { Write-Host "[verbose] Copied from real scoop to cache dir" }
             }
         }
+    }
+
+    # Only claim success when the package is actually present in the cache dir
+    $finalPkgDir = Join-Path (Join-Path $cacheDir 'apps') $parsed.Name
+    if (-not (Test-PackageInstalled -PkgDir $finalPkgDir)) {
+        Write-Host ""
+        Write-Host "[scoopx] ERROR: '$($parsed.Name)' was not installed into the cache:" -ForegroundColor Red
+        Write-Host "  $finalPkgDir" -ForegroundColor Red
+        if ($scoopOutput) {
+            Write-Host "[scoopx] scoop reported:"
+            foreach ($line in $scoopOutput) { if ($line) { Write-Host "  $line" } }
+        }
+        return $null
     }
 
     if (-not $SILENT) { Write-Host -NoNewline "`r[scoopx] Package installed.                                                   " }
@@ -658,6 +757,7 @@ function Invoke-InstallList {
     $pkgName = $parsed.Name
 
     $cacheDir = Install-Package -PkgSpec $pkg -PkgName $pkgName
+    if (-not $cacheDir) { exit 1 }
 
     $appDir = Join-Path (Join-Path $cacheDir 'apps') $pkgName
     $items = @()
@@ -683,13 +783,8 @@ function Invoke-InstallList {
 
     if ($m) {
         if ($m.bin) {
-            $raw = @($m.bin)
-            if ($m.bin -is [string]) { $raw = @($m.bin) }
-            foreach ($b in $raw) {
-                $bName = if ($b -is [string]) { $b } else { $b[0] }
-                $bArgs = if ($b -is [string]) { @() } else { $b[1..($b.Length-1)] }
-                $bLabel = [IO.Path]::GetFileNameWithoutExtension($bName)
-                $items += [PSCustomObject]@{Type='bin'; Label=$bLabel; Exe=$bName; Args=$bArgs; Path=$null}
+            foreach ($binDef in (Get-ManifestBins -Manifest $m)) {
+                $items += [PSCustomObject]@{Type='bin'; Label=$binDef.Label; Exe=$binDef.Exe; Args=$binDef.Args; Path=$null}
             }
         }
         if ($m.shortcuts) {
@@ -724,13 +819,26 @@ function Invoke-InstallList {
     if (-not $selected) { Write-Host "Invalid selection."; exit 1 }
 
     Run-WithEnv -CacheDir $cacheDir -ScriptBlock {
+        $src = $null
         if ($selected.Type -eq 'bin') {
-            $src = Join-Path $appDir "current\$($selected.Exe)"
-            if (-not (Test-Path $src)) { $src = Join-Path $cacheDir "shims\$($selected.Label).cmd" }
+            $src = Resolve-PackageBinary -AppDir $appDir -CacheDir $cacheDir -ExePath $selected.Exe -Label $selected.Label
+            if (-not $src) {
+                $tried = Get-PackageBinaryCandidates -AppDir $appDir -CacheDir $cacheDir -ExePath $selected.Exe -Label $selected.Label
+                Write-Host "Not found: $($selected.Exe) (bin '$($selected.Label)')" -ForegroundColor Red
+                Write-Host ("  Tried: " + ($tried -join ' ; ')) -ForegroundColor Red
+                Write-Host "  Also searched under: $(Join-Path $appDir 'current')" -ForegroundColor Red
+                exit 1
+            }
             & $src $selected.Args
         } else {
-            if (Test-Path $selected.Path) { & $selected.Path }
-            else { Write-Host "Not found: $($selected.Exe)"; exit 1 }
+            $src = Resolve-PackageBinary -AppDir $appDir -CacheDir $cacheDir -ExePath $selected.Exe -Label $null
+            if (-not $src) {
+                $tried = Get-PackageBinaryCandidates -AppDir $appDir -CacheDir $cacheDir -ExePath $selected.Exe -Label $null
+                Write-Host "Not found: shortcut '$($selected.Label)' ($($selected.Exe))" -ForegroundColor Red
+                Write-Host ("  Tried: " + ($tried -join ' ; ')) -ForegroundColor Red
+                exit 1
+            }
+            & $src
         }
     }
     exit $LASTEXITCODE
@@ -767,24 +875,17 @@ function Invoke-InstallRun {
     $binPath = $null
     $binArgs = @()
 
-    if ($m -and $m.bin) {
-        $raw = @($m.bin)
-        if ($m.bin -is [string]) { $raw = @($m.bin) }
-        foreach ($b in $raw) {
-            $bName = if ($b -is [string]) { $b } else { $b[0] }
-            $bLabel = [IO.Path]::GetFileNameWithoutExtension($bName)
-            if ($bLabel -ieq $binName -or $bName -ieq $binName -or $bLabel -ieq "$binName.exe" -or $bName -ieq "$binName.exe") {
-                $appDir = Join-Path (Join-Path $cacheDir 'apps') $pkgName
-                $src = Join-Path $appDir "current\$bName"
-                if (Test-Path $src) {
+    if ($m) {
+        $appDir = Join-Path (Join-Path $cacheDir 'apps') $pkgName
+        foreach ($binDef in (Get-ManifestBins -Manifest $m)) {
+            $bName = $binDef.Exe
+            $bLabel = $binDef.Label
+            $bFile = [IO.Path]::GetFileNameWithoutExtension($bName)
+            if ($bLabel -ieq $binName -or $bName -ieq $binName -or $bFile -ieq $binName -or $bLabel -ieq "$binName.exe" -or $bName -ieq "$binName.exe" -or $bFile -ieq "$binName.exe") {
+                $src = Resolve-PackageBinary -AppDir $appDir -CacheDir $cacheDir -ExePath $bName -Label $bLabel
+                if ($src) {
                     $binPath = $src
-                    if ($b -isnot [string]) { $binArgs = $b[1..($b.Length-1)] }
-                    break
-                }
-                $src = Join-Path $cacheDir "shims\$bLabel.cmd"
-                if (Test-Path $src) {
-                    $binPath = $src
-                    if ($b -isnot [string]) { $binArgs = $b[1..($b.Length-1)] }
+                    $binArgs = $binDef.Args
                     break
                 }
             }
@@ -875,8 +976,14 @@ function Invoke-Shortcut {
     if (-not $selected) { Write-Host "Invalid selection."; exit 1 }
 
     Run-WithEnv -CacheDir $cacheDir -ScriptBlock {
-        if (Test-Path $selected.Path) { & $selected.Path }
-        else { Write-Host "Not found: $($selected.Exe)"; exit 1 }
+        $src = Resolve-PackageBinary -AppDir $appDir -CacheDir $cacheDir -ExePath $selected.Exe -Label $null
+        if (-not $src) {
+            $tried = Get-PackageBinaryCandidates -AppDir $appDir -CacheDir $cacheDir -ExePath $selected.Exe -Label $null
+            Write-Host "Not found: shortcut '$($selected.Label)' ($($selected.Exe))" -ForegroundColor Red
+            Write-Host ("  Tried: " + ($tried -join ' ; ')) -ForegroundColor Red
+            exit 1
+        }
+        & $src
     }
     exit $LASTEXITCODE
 }
@@ -906,15 +1013,11 @@ function Invoke-ListBin {
     if ($manifest) { $m = Get-Content $manifest.FullName -Raw | ConvertFrom-Json }
     if (-not $m) { Write-Host "ERROR: Package '$pkg' not found in scoop buckets."; exit 1 }
 
-    if ($m.bin) {
-        $raw = @($m.bin)
-        if ($m.bin -is [string]) { $raw = @($m.bin) }
-        foreach ($b in $raw) {
-            $bName = if ($b -is [string]) { $b } else { $b[0] }
-            $bArgs = if ($b -is [string]) { @() } else { $b[1..($b.Length-1)] }
-            $bLabel = [IO.Path]::GetFileNameWithoutExtension($bName)
-            $argStr = if ($bArgs.Count -gt 0) { " " + ($bArgs -join ' ') } else { '' }
-            Write-Host "  $bLabel  ($bName)$argStr"
+    $bins = Get-ManifestBins -Manifest $m
+    if ($bins.Count -gt 0) {
+        foreach ($binDef in $bins) {
+            $argStr = if ($binDef.Args.Count -gt 0) { " " + ($binDef.Args -join ' ') } else { '' }
+            Write-Host "  $($binDef.Label)  ($($binDef.Exe))$argStr"
         }
     } else {
         Write-Host "No bin entries found for '$pkg'."
@@ -957,14 +1060,10 @@ function Invoke-HasBin {
         }
 
         $names = @()
-        if ($m.bin) {
-            $raw = @($m.bin)
-            if ($m.bin -is [string]) { $raw = @($m.bin) }
-            foreach ($b in $raw) {
-                $bName = if ($b -is [string]) { $b } else { $b[0] }
-                $names += [IO.Path]::GetFileName($bName)
-                $names += [IO.Path]::GetFileNameWithoutExtension($bName)
-            }
+        foreach ($binDef in (Get-ManifestBins -Manifest $m)) {
+            $names += [IO.Path]::GetFileName($binDef.Exe)
+            $names += [IO.Path]::GetFileNameWithoutExtension($binDef.Exe)
+            $names += $binDef.Label
         }
         if ($m.shortcuts) {
             foreach ($s in $m.shortcuts) {
