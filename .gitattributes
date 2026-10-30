@@ -1,4 +1,4 @@
 * text=auto eol=lf
-*.bat text eol=lf
-*.cmd text eol=lf
-*.ps1 text eol=lf
+# Windows batch files must keep their bytes (CRLF) — never let git normalize them.
+*.bat -text
+*.cmd -text

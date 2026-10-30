@@ -50,6 +50,8 @@ Invoke-WebRequest https://raw.githubusercontent.com/dodorz/scoopx/main/scoopx.ba
 Make sure `%USERPROFILE%\Tools\bin` is on your `PATH`.
 
 > Note: the file must keep the name `scoopx.bat` (or be wrapped by a `.cmd` shim that forwards `%*`).
+>
+> Keep the file's **CRLF** line endings. `cmd.exe` needs CRLF for batch files, so don't convert it to LF or let an editor "normalize" it. `.gitattributes` disables EOL conversion for `*.bat` / `*.cmd` to keep the bytes intact.
 
 ## Usage
 
